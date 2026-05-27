@@ -357,6 +357,7 @@ def _validate_png_chart_layout(docx_path: Path, payload: dict) -> None:
     root, ns = _document_xml_root(docx_path)
     paragraphs = root.findall(".//w:p", ns)
     texts = [_paragraph_text(paragraph, ns) for paragraph in paragraphs]
+    chart_ns = {"c": "http://schemas.openxmlformats.org/drawingml/2006/chart"}
 
     def index_of(target: str) -> int | None:
         for index, text in enumerate(texts):
@@ -370,37 +371,65 @@ def _validate_png_chart_layout(docx_path: Path, payload: dict) -> None:
     key_start = index_of("5.1问卷重点问题分析")
     key_end = index_of("5.2调研结果分析")
 
-    def drawings_between(start: int | None, end: int | None) -> tuple[int, int]:
+    def drawings_between(start: int | None, end: int | None) -> tuple[int, list[str]]:
         if start is None or end is None or end <= start:
-            return 0, 0
+            return 0, []
         drawing_count = 0
-        native_chart_refs = 0
+        native_chart_refs = []
         for paragraph in paragraphs[start + 1:end]:
             if paragraph.findall(".//w:drawing", ns):
                 drawing_count += 1
-            if paragraph.findall(".//c:chart", {"c": "http://schemas.openxmlformats.org/drawingml/2006/chart"}):
-                native_chart_refs += 1
+            for chart in paragraph.findall(".//c:chart", chart_ns):
+                native_chart_refs.append(chart.attrib.get("{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id", ""))
         return drawing_count, native_chart_refs
 
     result_drawings, result_chart_refs = drawings_between(result_idx, section_idx)
     key_drawings, key_chart_refs = drawings_between(key_start, key_end)
-    if result_drawings != 2 or result_chart_refs != 0:
+    if result_drawings != 2 or len(result_chart_refs) != 0:
         raise FinalValidationError("Result-analysis overview charts must render as two PNG drawings, not native charts.")
     if payload.get("summary", {}).get("key_issue_items"):
-        if key_drawings != 2 or key_chart_refs != 0:
-            raise FinalValidationError("5.1 key issue charts must render as two PNG drawings, not native charts.")
+        if key_drawings != 2 or len(key_chart_refs) != 2:
+            raise FinalValidationError("5.1 key issue charts must render as two native editable charts.")
 
     with ZipFile(docx_path) as zipped:
         media = [name for name in zipped.namelist() if name.startswith("word/media/") and name != "word/media/"]
         chart_parts = [name for name in zipped.namelist() if re.match(r"word/charts/chart\d+\.xml$", name)]
+        rels_root = ET.fromstring(zipped.read("word/_rels/document.xml.rels"))
+        relmap = {rel.attrib.get("Id", ""): rel.attrib.get("Target", "") for rel in rels_root}
+        key_chart_targets = [relmap.get(rel_id, "") for rel_id in key_chart_refs]
+        if payload.get("summary", {}).get("key_issue_items"):
+            if key_chart_targets != ["charts/chart3.xml", "charts/chart4.xml"]:
+                raise FinalValidationError("5.1 native chart relationship targets are incorrect.")
+            key_issue_items = payload.get("summary", {}).get("key_issue_items", [])[:2]
+            for target, item in zip(key_chart_targets, key_issue_items):
+                chart_xml = zipped.read(f"word/{target}")
+                chart_root = ET.fromstring(chart_xml)
+                if chart_root.find(".//c:pie3DChart", chart_ns) is None:
+                    raise FinalValidationError("5.1 native chart is not a 3D pie chart.")
+                title = "".join(node.text or "" for node in chart_root.findall(".//c:title//a:t", {
+                    "c": "http://schemas.openxmlformats.org/drawingml/2006/chart",
+                    "a": "http://schemas.openxmlformats.org/drawingml/2006/main",
+                })).strip()
+                if title != str(item.get("chart_title", "")).strip():
+                    raise FinalValidationError("5.1 native chart title does not match payload.")
+                categories = [node.text or "" for node in chart_root.findall(".//c:cat//c:strCache//c:pt/c:v", chart_ns)]
+                if categories != [str(value) for value in item.get("categories", [])]:
+                    raise FinalValidationError("5.1 native chart categories do not match payload.")
+                values = [float(node.text or 0) for node in chart_root.findall(".//c:val//c:numCache//c:pt/c:v", chart_ns)]
+                expected_values = [float(value) for value in item.get("values", [])]
+                if expected_values and sum(expected_values) > 1.5:
+                    expected_values = [value / 100 for value in expected_values]
+                if len(values) != len(expected_values) or any(abs(left - right) > 0.000001 for left, right in zip(values, expected_values)):
+                    raise FinalValidationError("5.1 native chart values do not match payload.")
     template_doc = payload.get("meta", {}).get("template_doc")
     if template_doc:
         with ZipFile(template_doc) as zipped:
             template_media = [name for name in zipped.namelist() if name.startswith("word/media/") and name != "word/media/"]
             template_chart_parts = [name for name in zipped.namelist() if re.match(r"word/charts/chart\d+\.xml$", name)]
-        if sorted(chart_parts) != sorted(template_chart_parts):
-            raise FinalValidationError("Rendered docx changed template chart part inventory.")
-        if len(media) < len(template_media) + 4:
+        expected_chart_parts = sorted(template_chart_parts + ["word/charts/chart3.xml", "word/charts/chart4.xml"])
+        if sorted(chart_parts) != expected_chart_parts:
+            raise FinalValidationError("Rendered docx native chart part inventory is incorrect.")
+        if len(media) < len(template_media) + 2:
             raise FinalValidationError("Rendered docx is missing generated PNG chart media.")
 
 

@@ -23,6 +23,7 @@ import shutil
 import tempfile
 import xml.etree.ElementTree as ET
 import zipfile
+from io import BytesIO
 from pathlib import Path
 from typing import Optional
 
@@ -32,6 +33,7 @@ from docx.oxml.ns import qn
 from docx.shared import Pt, Inches
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.text.paragraph import Paragraph
+from openpyxl import Workbook
 
 
 # ─── OOXML Namespace constants ───────────────────────────────────────────────
@@ -119,6 +121,27 @@ def _paragraph_has_drawing(p_element) -> bool:
         run.find(qn("w:drawing")) is not None or run.find(qn("w:pict")) is not None
         for run in p_element.findall(qn("w:r"))
     )
+
+
+def _paragraph_has_chart(p_element) -> bool:
+    return bool(p_element.findall(".//c:chart", NS))
+
+
+def _clone_first_chart_paragraph(p_element, relationship_id: str):
+    cloned = copy.deepcopy(p_element)
+    kept_chart = False
+    for run in list(cloned.findall(qn("w:r"))):
+        charts = run.findall(".//c:chart", NS)
+        if not charts or kept_chart:
+            cloned.remove(run)
+            continue
+        charts[0].set(qn("r:id"), relationship_id)
+        for extra_chart in charts[1:]:
+            parent = extra_chart.getparent() if hasattr(extra_chart, "getparent") else None
+            if parent is not None:
+                parent.remove(extra_chart)
+        kept_chart = True
+    return cloned if kept_chart else None
 
 
 def _set_run_text(run_element, text: str):
@@ -372,6 +395,9 @@ def _update_chart_data(chart_xml_path: Path, categories: list[str], values: list
         num_ref = c_cat.find(f"{{{c_ns}}}numRef")
 
         if str_ref is not None:
+            formula = str_ref.find(f"{{{c_ns}}}f")
+            if formula is not None:
+                formula.text = f"Sheet1!$A$2:$A${len(categories) + 1}"
             # Update strCache
             str_cache = str_ref.find(f"{{{c_ns}}}strCache")
             if str_cache is not None:
@@ -409,6 +435,9 @@ def _update_chart_data(chart_xml_path: Path, categories: list[str], values: list
     for c_val in root.iter(f"{{{c_ns}}}val"):
         num_ref = c_val.find(f"{{{c_ns}}}numRef")
         if num_ref is not None:
+            formula = num_ref.find(f"{{{c_ns}}}f")
+            if formula is not None:
+                formula.text = f"Sheet1!$B$2:$B${len(values) + 1}"
             num_cache = num_ref.find(f"{{{c_ns}}}numCache")
             if num_cache is not None:
                 format_code = num_cache.find(f"{{{c_ns}}}formatCode")
@@ -431,6 +460,9 @@ def _update_chart_data(chart_xml_path: Path, categories: list[str], values: list
         if cat_elem is not None:
             str_ref = cat_elem.find(f"{{{c_ns}}}strRef")
             if str_ref is not None:
+                formula = str_ref.find(f"{{{c_ns}}}f")
+                if formula is not None:
+                    formula.text = f"Sheet1!$A$2:$A${len(categories) + 1}"
                 str_cache = str_ref.find(f"{{{c_ns}}}strCache")
                 if str_cache is not None:
                     for pt in list(str_cache.findall(f"{{{c_ns}}}pt")):
@@ -447,6 +479,9 @@ def _update_chart_data(chart_xml_path: Path, categories: list[str], values: list
         if val_elem is not None:
             num_ref = val_elem.find(f"{{{c_ns}}}numRef")
             if num_ref is not None:
+                formula = num_ref.find(f"{{{c_ns}}}f")
+                if formula is not None:
+                    formula.text = f"Sheet1!$B$2:$B${len(values) + 1}"
                 num_cache = num_ref.find(f"{{{c_ns}}}numCache")
                 if num_cache is not None:
                     for pt in list(num_cache.findall(f"{{{c_ns}}}pt")):
@@ -1534,6 +1569,14 @@ class TemplateRenderer:
             if found_intro and _paragraph_has_drawing(child):
                 drawing_paragraphs.append(child)
 
+        native_pie_template = None
+        for paragraph in drawing_paragraphs:
+            if not _paragraph_has_chart(paragraph):
+                continue
+            native_pie_template = _clone_first_chart_paragraph(paragraph, "rIdJlkKeyIssueChart1")
+            if native_pie_template is not None:
+                break
+
         for idx, png in enumerate(overview_pngs):
             if idx < len(drawing_paragraphs):
                 self._replace_paragraph_with_image(drawing_paragraphs[idx], png)
@@ -1554,20 +1597,13 @@ class TemplateRenderer:
             self._rebuild_anchors()
             return
 
-        insert_before = self._get_paragraph_at(start_idx + 1) if start_idx + 1 < end_idx else self._get_paragraph_at(end_idx)
-        for idx, item in enumerate(key_issue_items[:2]):
-            chart = {
-                "title": item.get("chart_title", ""),
-                "chart_type": item.get("chart_type", "pie"),
-                "categories": item.get("categories", []),
-                "values": item.get("values", []),
-            }
-            png = self._make_chart_png(chart, chart_dir / f"key_issue_{idx + 1}.png", role="key_issue")
-            if not png:
-                continue
-            image_p = OxmlElement("w:p")
-            insert_before.addprevious(image_p)
-            self._replace_paragraph_with_image(image_p, png)
+        if native_pie_template is not None:
+            insert_before = self._get_paragraph_at(start_idx + 1) if start_idx + 1 < end_idx else self._get_paragraph_at(end_idx)
+            for idx in range(min(2, len(key_issue_items))):
+                chart_paragraph = copy.deepcopy(native_pie_template)
+                for chart in chart_paragraph.findall(".//c:chart", NS):
+                    chart.set(qn("r:id"), f"rIdJlkKeyIssueChart{idx + 1}")
+                insert_before.addprevious(chart_paragraph)
 
         self._rebuild_anchors()
 
@@ -2042,6 +2078,127 @@ class TemplateRenderer:
         docx_path.unlink()
         tmp_path.rename(docx_path)
 
+    def _key_issue_chart_values(self, values: list) -> list[float]:
+        numeric = [float(value) for value in values]
+        if numeric and sum(numeric) > 1.5:
+            return [value / 100 for value in numeric]
+        return numeric
+
+    def _build_native_chart_xml(self, source_xml: bytes, title: str, categories: list[str], values: list[float]) -> bytes:
+        with tempfile.NamedTemporaryFile(suffix=".xml", delete=False) as tf:
+            tf.write(source_xml)
+            temp_path = Path(tf.name)
+        try:
+            _update_chart_data(temp_path, categories, values, title)
+            return temp_path.read_bytes()
+        finally:
+            temp_path.unlink(missing_ok=True)
+
+    def _build_native_chart_workbook(self, categories: list[str], values: list[float]) -> bytes:
+        workbook = Workbook()
+        worksheet = workbook.active
+        worksheet.title = "Sheet1"
+        worksheet["A1"] = " "
+        worksheet["B1"] = "占比"
+        for index, (category, value) in enumerate(zip(categories, values), start=2):
+            worksheet.cell(row=index, column=1).value = category
+            value_cell = worksheet.cell(row=index, column=2)
+            value_cell.value = value
+            value_cell.number_format = "0.00%"
+        output = BytesIO()
+        workbook.save(output)
+        return output.getvalue()
+
+    def _add_content_type_override(self, content_types_xml: bytes, part_name: str, content_type: str) -> bytes:
+        ns = {"ct": "http://schemas.openxmlformats.org/package/2006/content-types"}
+        root = ET.fromstring(content_types_xml)
+        for override in root.findall("ct:Override", ns):
+            if override.attrib.get("PartName") == part_name:
+                return content_types_xml
+        override = ET.Element(f"{{{ns['ct']}}}Override")
+        override.set("PartName", part_name)
+        override.set("ContentType", content_type)
+        root.append(override)
+        return ET.tostring(root, encoding="utf-8", xml_declaration=True)
+
+    def _add_document_chart_relationships(self, rels_xml: bytes) -> bytes:
+        rel_ns = "http://schemas.openxmlformats.org/package/2006/relationships"
+        chart_type = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart"
+        root = ET.fromstring(rels_xml)
+        existing = {rel.attrib.get("Id") for rel in root}
+        for index in (1, 2):
+            rel_id = f"rIdJlkKeyIssueChart{index}"
+            if rel_id in existing:
+                continue
+            rel = ET.Element(f"{{{rel_ns}}}Relationship")
+            rel.set("Id", rel_id)
+            rel.set("Type", chart_type)
+            rel.set("Target", f"charts/chart{index + 2}.xml")
+            root.append(rel)
+        return ET.tostring(root, encoding="utf-8", xml_declaration=True)
+
+    def _build_chart_relationships(self, source_rels: bytes, workbook_name: str) -> bytes:
+        rel_ns = "http://schemas.openxmlformats.org/package/2006/relationships"
+        package_type = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/package"
+        root = ET.fromstring(source_rels)
+        for rel in root:
+            if rel.attrib.get("Type") == package_type:
+                rel.set("Target", f"../embeddings/{workbook_name}")
+        return ET.tostring(root, encoding="utf-8", xml_declaration=True)
+
+    def _write_native_key_issue_chart_parts(self, docx_path: Path):
+        key_issue_items = self.payload.get("summary", {}).get("key_issue_items", [])[:2]
+        if not key_issue_items:
+            return
+
+        tmp_path = docx_path.with_suffix(".keycharts.tmp.docx")
+        chart_content_type = "application/vnd.openxmlformats-officedocument.drawingml.chart+xml"
+        with zipfile.ZipFile(docx_path, "r") as zin:
+            source_chart = zin.read("word/charts/chart1.xml")
+            source_chart_rels = zin.read("word/charts/_rels/chart1.xml.rels")
+            generated: dict[str, bytes] = {
+                "word/_rels/document.xml.rels": self._add_document_chart_relationships(
+                    zin.read("word/_rels/document.xml.rels")
+                ),
+                "[Content_Types].xml": zin.read("[Content_Types].xml"),
+            }
+
+            for index, item in enumerate(key_issue_items, start=1):
+                chart_name = f"word/charts/chart{index + 2}.xml"
+                workbook_name = f"Workbook{index + 3}.xlsx"
+                workbook_path = f"word/embeddings/{workbook_name}"
+                chart_rels_name = f"word/charts/_rels/chart{index + 2}.xml.rels"
+                categories = [str(value) for value in item.get("categories", [])]
+                values = self._key_issue_chart_values(item.get("values", []))
+                generated[chart_name] = self._build_native_chart_xml(
+                    source_chart,
+                    item.get("chart_title", ""),
+                    categories,
+                    values,
+                )
+                generated[workbook_path] = self._build_native_chart_workbook(categories, values)
+                generated[chart_rels_name] = self._build_chart_relationships(source_chart_rels, workbook_name)
+                generated["[Content_Types].xml"] = self._add_content_type_override(
+                    generated["[Content_Types].xml"],
+                    f"/{chart_name}",
+                    chart_content_type,
+                )
+
+            with zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_DEFLATED) as zout:
+                replaced = set()
+                for item in zin.infolist():
+                    if item.filename in generated:
+                        zout.writestr(item, generated[item.filename])
+                        replaced.add(item.filename)
+                    else:
+                        zout.writestr(item, zin.read(item.filename))
+                for filename, data in generated.items():
+                    if filename not in replaced:
+                        zout.writestr(filename, data)
+
+        docx_path.unlink()
+        tmp_path.rename(docx_path)
+
     def _enable_update_fields_on_open(self, docx_path: Path):
         """Ensure Word refreshes fields such as TOC on document open."""
         tmp_path = docx_path.with_suffix(".settings.tmp.docx")
@@ -2152,9 +2309,9 @@ class TemplateRenderer:
 
         # Phase 2: Global XML-level text cleanup (catch anything missed)
         self._global_replace_in_xml(output_path)
+        self._write_native_key_issue_chart_parts(output_path)
 
-        # Phase 3: Enable field updates on open. Charts are rendered as PNG
-        # images in the document body to avoid platform-specific Office chart drift.
+        # Phase 3: Enable field updates on open and normalize final XML.
         self._enable_update_fields_on_open(output_path)
         self._normalize_font_references(output_path)
 

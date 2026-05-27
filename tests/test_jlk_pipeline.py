@@ -380,6 +380,44 @@ def copy_docx_with_document_xml_replace(source: Path, target: Path, old: str, ne
             dst.writestr(item, data)
 
 
+def chart_refs_between(docx_path: Path, start_text: str, end_text: str) -> list[str]:
+    ns = {
+        "w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main",
+        "c": "http://schemas.openxmlformats.org/drawingml/2006/chart",
+        "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
+    }
+    with ZipFile(docx_path) as zipped:
+        root = ET.fromstring(zipped.read("word/document.xml"))
+        rels = ET.fromstring(zipped.read("word/_rels/document.xml.rels"))
+    relmap = {rel.attrib["Id"]: rel.attrib.get("Target", "") for rel in rels}
+    inside = False
+    refs: list[str] = []
+    for paragraph in root.findall(".//w:body/w:p", ns):
+        text = "".join(node.text or "" for node in paragraph.findall(".//w:t", ns)).strip()
+        if text == start_text:
+            inside = True
+            continue
+        if text == end_text:
+            break
+        if inside:
+            for chart in paragraph.findall(".//c:chart", ns):
+                refs.append(relmap.get(chart.attrib.get(f"{{{ns['r']}}}id"), ""))
+    return refs
+
+
+def chart_part_type(docx_path: Path, chart_target: str) -> str:
+    chart_name = f"word/{chart_target}" if not chart_target.startswith("word/") else chart_target
+    ns = {"c": "http://schemas.openxmlformats.org/drawingml/2006/chart"}
+    with ZipFile(docx_path) as zipped:
+        root = ET.fromstring(zipped.read(chart_name))
+    chart_types = []
+    for elem in root.iter():
+        tag = elem.tag.rsplit("}", 1)[-1]
+        if tag.endswith("Chart") and tag not in {"chart", "plotArea"}:
+            chart_types.append(tag)
+    return chart_types[0] if chart_types else ""
+
+
 class PipelineTest(unittest.TestCase):
     def test_cluster_dimensions_uses_efficacy_template(self) -> None:
         grouped = cluster_dimensions(efficacy_questionnaire())
@@ -765,10 +803,10 @@ class PipelineTest(unittest.TestCase):
                 styles_xml = zipped.read("word/styles.xml").decode("utf-8", "ignore")
                 theme_xml = zipped.read("word/theme/theme1.xml").decode("utf-8", "ignore")
                 settings_xml = zipped.read("word/settings.xml").decode("utf-8", "ignore")
-                chart_names = [name for name in zipped.namelist() if re.match(r"word/charts/chart\\d+\\.xml$", name)]
+                chart_names = [name for name in zipped.namelist() if re.match(r"word/charts/chart\d+\.xml$", name)]
                 media_files = [name for name in zipped.namelist() if name.startswith("word/media/") and name != "word/media/"]
             with ZipFile(Path(payload["meta"]["template_doc"])) as template_zipped:
-                template_chart_names = [name for name in template_zipped.namelist() if re.match(r"word/charts/chart\\d+\\.xml$", name)]
+                template_chart_names = [name for name in template_zipped.namelist() if re.match(r"word/charts/chart\d+\.xml$", name)]
                 template_media_files = [name for name in template_zipped.namelist() if name.startswith("word/media/") and name != "word/media/"]
             self.assertIn('TOC \\o "1-3" \\h \\u', xml)
             self.assertNotIn("w:sdt", xml)
@@ -780,8 +818,10 @@ class PipelineTest(unittest.TestCase):
             self.assertIn("宋体", styles_xml)
             self.assertIn("宋体", theme_xml)
             self.assertNotIn("汉仪中宋简", xml + styles_xml + theme_xml)
-            self.assertEqual(sorted(chart_names), sorted(template_chart_names))
-            self.assertGreaterEqual(len(media_files), len(template_media_files) + 4)
+            self.assertEqual(sorted(chart_names), sorted(template_chart_names + ["word/charts/chart3.xml", "word/charts/chart4.xml"]))
+            self.assertIn("word/charts/chart3.xml", chart_names)
+            self.assertIn("word/charts/chart4.xml", chart_names)
+            self.assertGreaterEqual(len(media_files), len(template_media_files) + 2)
 
             preface_idx = texts.index("前言")
             title_idx = texts.index(payload["report_title"])
@@ -805,6 +845,9 @@ class PipelineTest(unittest.TestCase):
             key_issue_drawings = [i for i in drawing_indices if key_issue_heading_idx < i < key_issue_end_idx]
             self.assertEqual(len(result_drawings), 2)
             self.assertEqual(len(key_issue_drawings), 2)
+            key_issue_chart_refs = chart_refs_between(output_docx, "5.1问卷重点问题分析", "5.2调研结果分析")
+            self.assertEqual(key_issue_chart_refs, ["charts/chart3.xml", "charts/chart4.xml"])
+            self.assertEqual([chart_part_type(output_docx, ref) for ref in key_issue_chart_refs], ["pie3DChart", "pie3DChart"])
 
             xml_root = ET.fromstring(xml.encode("utf-8"))
             ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
