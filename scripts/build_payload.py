@@ -831,6 +831,30 @@ def choose_overall_analysis(ai_paragraphs: list[str], fallback: list[str]) -> li
     return fallback
 
 
+def choose_recommendations(ai_paragraphs: list[str], fallback: list[str]) -> list[str]:
+    normalized = choose_body_paragraphs(ai_paragraphs, [])
+    if not normalized:
+        return fallback
+    if any("药企" in paragraph for paragraph in normalized):
+        return fallback
+
+    total_len = sum(len(paragraph) for paragraph in normalized)
+    numbered_items = [paragraph for paragraph in normalized if re.match(r"^\d+\.\s*\S+", paragraph)]
+    has_intro = bool(normalized and normalized[0] not in numbered_items)
+    intro_valid = not has_intro or (
+        40 <= len(normalized[0]) <= 120
+        and any(keyword in normalized[0] for keyword in ("基于", "结合"))
+        and "建议" in normalized[0]
+    )
+    target_keywords = ("针对", "围绕", "聚焦", "面向", "建议")
+    item_lengths_valid = all(80 <= len(item) <= 180 for item in numbered_items)
+    item_targets_valid = all(any(keyword in item for keyword in target_keywords) for item in numbered_items)
+
+    if intro_valid and 2 <= len(numbered_items) <= 4 and 300 <= total_len <= 700 and item_lengths_valid and item_targets_valid:
+        return normalized
+    return fallback
+
+
 def build_payload(questionnaire: dict, meta: dict, content: dict, cli_args: argparse.Namespace) -> dict:
     ai_dimensions = parse_dimensions_from_meta(meta) if meta else None
     grouped = cluster_dimensions(questionnaire, ai_dimensions=ai_dimensions)
@@ -1023,7 +1047,10 @@ def build_payload(questionnaire: dict, meta: dict, content: dict, cli_args: argp
             "key_issue_items": key_issue_items,
             "overall_analysis": choose_overall_analysis(content["summary"]["overall_analysis"], programmatic_overall_analysis),
             "overall_analysis_programmatic": programmatic_overall_analysis,
-            "recommendations": build_programmatic_recommendations(product, region),
+            "recommendations": choose_recommendations(
+                content["summary"]["recommendations"],
+                build_programmatic_recommendations(product, region),
+            ),
         },
         "attachments": {
             "attachment1_name": cli_args.attachment_name or meta.get("attachment_name") or "问卷调查附件",

@@ -22,6 +22,8 @@ if str(ROOT) not in sys.path:
 
 from scripts.build_payload import (
     build_payload,
+    build_programmatic_recommendations,
+    choose_recommendations,
     derive_preface,
     derive_project_background,
     normalize_survey_period,
@@ -277,6 +279,15 @@ disclaimer_unit: 北京玖麟空科技有限公司
 """
 
 
+def valid_ai_recommendations() -> list[str]:
+    return [
+        "基于调研结果，为进一步提升厄贝沙坦氢氯噻嗪片的临床应用效果与患者用药体验，围绕剂量执行、监测管理和渠道安全提出以下针对性建议：",
+        "1. 针对血压偶尔波动、自行调剂量及监测不规律的重点群体，医生和药师需强化用药规范性教育，通过复诊宣讲、线上科普短视频、血压监测记录表等载体，强调剂量调整必须遵医嘱，并引导患者形成稳定记录习惯，便于后续精准优化治疗方案。",
+        "2. 围绕联合用药确认不足和复杂场景疑问，医疗机构可完善药师咨询与随访提醒机制，在门诊取药窗口、医患沟通群和患者手册中补充药物兼容性提示，推动患者在合并其他疾病治疗时主动咨询医生或药师，降低自行判断带来的用药风险。",
+        "3. 针对非正规购药和偶尔缺货对治疗连续性的潜在影响，渠道保障层面需加强正规路径引导，通过药店公示、社区宣传和供应预警台账等方式，提示患者选择医院药房、正规连锁药店或合规线上平台购药，并持续优化区域库存保障。",
+    ]
+
+
 def dynamic_ai_dimensions() -> dict:
     return {
         "dimensions": [
@@ -341,6 +352,15 @@ class PipelineTest(unittest.TestCase):
         self.assertIn("question_refs", subtopic_1)
         self.assertEqual(subtopic_1["subtitle"], "血压控制效果分析")
         self.assertGreater(len(subtopic_1["question_refs"]), 0)
+
+    def test_choose_recommendations_uses_valid_ai_and_rejects_weak_or_forbidden_subjects(self) -> None:
+        fallback = build_programmatic_recommendations("厄贝沙坦氢氯噻嗪片", "北京市")
+        ai_recommendations = valid_ai_recommendations()
+        self.assertEqual(choose_recommendations(ai_recommendations, fallback), ai_recommendations)
+        self.assertEqual(choose_recommendations(["1. 补充场景化患者教育材料。"], fallback), fallback)
+        forbidden_subject = ai_recommendations.copy()
+        forbidden_subject[2] = forbidden_subject[2].replace("医疗机构可完善", "药企方面可完善")
+        self.assertEqual(choose_recommendations(forbidden_subject, fallback), fallback)
 
     def test_build_payload_matches_template_slots(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
